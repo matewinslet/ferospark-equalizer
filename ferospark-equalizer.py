@@ -4,9 +4,11 @@
 All audio processing is still done by EasyEffects. This app only reads and
 writes EasyEffects' GSettings keys and preset files.
 """
+import configparser
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -858,6 +860,239 @@ def list_presets():
     return sorted(names, key=str.lower)
 
 
+# ------------------------------------------------------------------ importing
+# Like Peace's Import button: read EQ settings made elsewhere. Two kinds of file:
+#   Peace presets (.peace, an INI file) and Equalizer APO text files (AutoEQ
+#   ParametricEQ.txt / GraphicEQ.txt, REW filter exports, Peace's peace.txt).
+# Shelf and pass-filter conversions follow EasyEffects' own APO importer, so an
+# imported file sounds the same as EasyEffects importing it itself.
+S_LO, S_HI = "Lo-shelf", "Hi-shelf"
+BUTTERWORTH_Q = math.sqrt(0.5)
+
+
+def shelf_q_from_slope(slope_db, gain):
+    """Equalizer APO's "LSC/HSC <slope> dB" (shelf slope S = slope/12) as an RBJ Q."""
+    s = min(max(slope_db / 12.0, 0.05), 1.0)
+    a = 10 ** (gain / 40)
+    return 1 / math.sqrt(max((a + 1 / a) * (1 / s - 1) + 2, 1e-6))
+
+
+# Peace's [Filters] codes (0 or missing = peak), from Peace's own filter list.
+PEACE_FILTERS = {0: "Bell", 1: "Lo-pass", 2: "Hi-pass", 3: "Bandpass", 4: S_LO, 5: S_HI,
+                 6: "Notch", 7: "Allpass", 8: S_LO, 9: S_HI, 10: "Lo-pass", 11: "Hi-pass",
+                 12: "Lo-pass", 13: "Hi-pass", 14: S_LO, 15: S_HI, 16: S_LO, 17: S_HI}
+
+
+def _num_or(txt, default):
+    try:
+        return float(str(txt).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_peace(text):
+    """A Peace preset → (bands, preamp, notes). Uses the "All speakers" settings."""
+    cp = configparser.ConfigParser(strict=False, interpolation=None)
+    cp.optionxform = str
+    cp.read_string(text)
+
+    def section(name, prefix):
+        out = {}
+        if cp.has_section(name):
+            for k, v in cp.items(name):
+                if k.startswith(prefix) and k[len(prefix):].isdigit():
+                    out[int(k[len(prefix):])] = v
+        return out
+
+    freqs = section("Frequencies", "Frequency")
+    if not freqs:
+        raise ValueError("no equalizer bands in this Peace file")
+    gains, quals = section("Gains", "Gain"), section("Qualities", "Quality")
+    kinds, off = section("Filters", "Filter"), section("Disabled", "Disabled")
+    gen = cp["General"] if cp.has_section("General") else {}
+    notes = set()
+    bands = []
+    for i in sorted(freqs):
+        if str(off.get(i, "")).strip().lower() in ("1", "true"):
+            continue
+        code = int(_num_or(kinds.get(i), 0))
+        btype = PEACE_FILTERS.get(code)
+        f, g, q = _num_or(freqs[i], 1000), _num_or(gains.get(i), 0.0), _num_or(quals.get(i), 1.41)
+        if btype is None or btype == "Allpass":
+            notes.add("all-pass and unknown filters were left out (they don't change the sound's balance)")
+            continue
+        if code in (4, 5):
+            q = 2 / 3  # Peace writes these without a Q; Equalizer APO's default shape
+        elif code in (8, 9):
+            q = shelf_q_from_slope(q, g)  # Peace keeps the slope in dB here, not a Q
+        elif code in (10, 11):
+            q = BUTTERWORTH_Q  # Quality holds the filter order here
+            notes.add("steep Butterworth filters became single 12 dB/octave filters")
+        elif code in (12, 13):
+            q = 0.5
+            notes.add("steep Linkwitz-Riley filters became single 12 dB/octave filters")
+        bands.append({"type": btype, "frequency": f, "gain": g, "q": q})
+    for key, btype in (("Bass", S_LO), ("Treble", S_HI)):
+        g = _num_or(gen.get(f"{key} Gain"), 0.0)
+        if g:
+            f = _num_or(gen.get(f"{key} Frequency"), 500 if key == "Bass" else 2000)
+            bands.append({"type": btype, "frequency": f, "gain": g, "q": 2 / 3})
+    if any(cp.has_section(f"{s}{n}") and any(_num_or(v, 0) for _, v in cp.items(f"{s}{n}"))
+           for s in ("Gains",) for n in range(1, 9)) or any(
+            k.startswith("PreAmp") and k != "PreAmp" for k in gen):
+        notes.add("per-speaker settings were left out; the All speakers settings were used")
+    return bands, _num_or(gen.get("PreAmp"), 0.0), notes
+
+
+APO_FILTER = re.compile(r"^\s*filter\s*\d*\s*:\s*(on|off)\s+([a-z]+(?:\s+\d+(?:\.\d+)?\s*db\b)?)", re.I)
+APO_FC = re.compile(r"\bfc\s+([\d,]*\d(?:\.\d+)?)\s*hz", re.I)
+APO_GAIN = re.compile(r"\bgain\s+([+-]?\d+(?:\.\d+)?)\s*db", re.I)
+APO_Q = re.compile(r"\bq\s+(\d+(?:\.\d+)?)", re.I)
+APO_BW = re.compile(r"\bbw\s+oct\s+(\d+(?:\.\d+)?)", re.I)
+
+
+def parse_apo(text):
+    """Equalizer APO config text → (bands, preamp, notes)."""
+    bands, preamp, notes, graphic = [], 0.0, set(), None
+    active = True  # False while a "Channel:" line picks only some speakers
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        head, rest = (s.strip() for s in line.split(":", 1))
+        head = head.lower()
+        if head == "channel":
+            chans = rest.upper().split()
+            active = "ALL" in chans or {"L", "R"} <= set(chans)
+            if not active:
+                notes.add("settings for single speakers were left out")
+            continue
+        if not active:
+            continue
+        if head == "preamp":
+            m = re.match(r"([+-]?\d+(?:\.\d+)?)\s*db", rest, re.I)
+            if m:
+                preamp += float(m.group(1))
+            continue
+        if head == "graphiceq":
+            pts = re.findall(r"([\d,]*\d(?:\.\d+)?)\s+([+-]?\d+(?:\.\d+)?)", rest)
+            graphic = [(float(f.replace(",", "")), float(g)) for f, g in pts]
+            continue
+        if head in ("include", "device", "stage", "eval", "if", "elseif", "else", "endif"):
+            continue
+        m = APO_FILTER.match(line)
+        if not m:
+            if head in ("delay", "copy", "convolution", "loudnesscorrection", "compressor"):
+                notes.add(f"{head.capitalize()} settings were left out (they aren't equalizer settings)")
+            continue
+        if m.group(1).lower() == "off":
+            continue
+        kind = re.sub(r"\s+", "", m.group(2).upper())  # "LS 12 dB" → "LS12DB"
+        slope = re.fullmatch(r"(LSC|HSC)(\d+(?:\.\d+)?)DB", kind)
+        if slope:  # "HSC 6 dB": a shelf with that slope per octave
+            kind = slope.group(1)
+        fm = APO_FC.search(line)
+        if not fm:
+            continue
+        f = float(fm.group(1).replace(",", ""))
+        gm, qm = APO_GAIN.search(line), APO_Q.search(line)
+        g = float(gm.group(1)) if gm else 0.0
+        q = float(qm.group(1)) if qm else None
+        if kind in ("PK", "PEQ", "MODAL"):
+            bw = APO_BW.search(line)
+            if q is None and bw:
+                n = 2 ** float(bw.group(1))
+                q = math.sqrt(n) / (n - 1)
+            band = ("Bell", g, q or 1.41)
+        elif kind in ("LP", "LPQ", "HP", "HPQ"):
+            band = ("Lo-pass" if kind.startswith("L") else "Hi-pass", 0.0, q or BUTTERWORTH_Q)
+        elif kind in ("LS", "HS"):
+            band = (S_LO if kind == "LS" else S_HI, g, q or 2 / 3)
+        elif kind in ("LSC", "HSC"):
+            if q is None and slope:
+                q = shelf_q_from_slope(float(slope.group(2)), g)
+            band = (S_LO if kind == "LSC" else S_HI, g, q or 2 / 3)
+        elif kind in ("LS6DB", "HS6DB"):
+            f = f * 2 / 3 if kind == "LS6DB" else f * math.sqrt(2)
+            band = (S_LO if kind.startswith("L") else S_HI, g, math.sqrt(2) / 3)
+        elif kind in ("LS12DB", "HS12DB"):
+            f = f * 3 / 2 if kind == "LS12DB" else f / math.sqrt(2)
+            band = (S_LO if kind.startswith("L") else S_HI, g, 2 / 3)
+        elif kind == "NO":
+            band = ("Notch", 0.0, q or 30.0)
+        elif kind == "BP":
+            band = ("Bandpass", 0.0, q or 1.0)
+        else:
+            notes.add("all-pass and unknown filters were left out (they don't change the sound's balance)")
+            continue
+        bands.append({"type": band[0], "frequency": f, "gain": band[1], "q": band[2]})
+    if graphic:
+        if bands:
+            notes.add("the file had both filters and a GraphicEQ line; only the filters were used")
+        else:
+            bands, level = fit_graphic_eq(graphic)
+            preamp += level
+            notes.add(f"the GraphicEQ curve ({len(graphic)} points) was matched with "
+                      f"{len(bands)} bands")
+    if not bands and not preamp:
+        raise ValueError("no equalizer settings found in this file")
+    return bands, preamp, notes
+
+
+def fit_graphic_eq(points):
+    """Match a GraphicEQ curve (frequency/gain points) with 1/3-octave peak bands."""
+    pts = sorted((f, g) for f, g in points if f > 0)
+    target = np.interp(np.log10(FREQS), [math.log10(f) for f, _ in pts], [g for _, g in pts])
+    # The overall level goes to the pre-amp, so the bands only carry the shape.
+    level = float(np.median(target))
+    target = target - level
+    centers = [min(20 * 2 ** (k / 3), 20000.0) for k in range(31)]  # 20 Hz … 20 kHz
+    q = 4.32  # 1/3-octave bandwidth
+    basis = np.array([band_response({"type": "Bell", "frequency": c, "gain": 1.0, "q": q})
+                      for c in centers]).T
+    lam = 0.002 * len(FREQS)  # a little smoothing: no zig-zag between neighbouring bands
+    normal = basis.T @ basis + lam * np.eye(len(centers))
+    gains = np.zeros(len(centers))
+    for _ in range(8):  # the shape of a peak changes a little with its gain, so refine
+        now = sum(band_response({"type": "Bell", "frequency": c, "gain": float(g), "q": q})
+                  for c, g in zip(centers, gains))
+        step = np.linalg.solve(normal, basis.T @ (target - now) - lam * gains)
+        gains = np.clip(gains + step, -30, 30)
+    return [{"type": "Bell", "frequency": round(c, 1), "gain": round(float(g), 1), "q": q}
+            for c, g in zip(centers, gains)], level
+
+
+def import_eq_file(path):
+    """Read a Peace or Equalizer APO file → (bands, preamp, notes). ValueError if unusable."""
+    with open(path, "rb") as fh:
+        data = fh.read(2_000_000)
+    for enc in ("utf-8-sig", "utf-16", "latin-1"):
+        try:
+            text = data.decode(enc)
+            if "\x00" not in text:
+                break
+        except UnicodeDecodeError:
+            continue
+    is_peace = path.lower().endswith(".peace") or re.search(r"^\[(Frequencies|Speakers)\]", text, re.M)
+    bands, preamp, notes = parse_peace(text) if is_peace else parse_apo(text)
+    clean = []
+    for b in bands:
+        if not 10 <= b["frequency"] <= 22000:
+            notes.add("filters outside 10 Hz to 22 kHz were left out")
+            continue
+        clean.append({"type": b["type"], "frequency": round(b["frequency"], 1),
+                      "gain": round(min(max(b["gain"], -30), 30), 1) if b["type"] not in NO_GAIN else 0.0,
+                      "q": round(min(max(b["q"], 0.1), 20), 3)})
+    if len(clean) > MAX_BANDS:  # drop bands that do nothing first
+        clean = [b for b in clean if b["type"] != "Bell" or b["gain"]]
+        if len(clean) > MAX_BANDS:
+            notes.add(f"only the first {MAX_BANDS} of {len(clean)} bands were kept")
+            clean = clean[:MAX_BANDS]
+    if not clean:
+        clean = [{"type": "Bell", "frequency": 1000.0, "gain": 0.0, "q": 1.41}]
+    return clean, round(min(max(preamp, -30), 10), 1), sorted(notes)
+
+
 # ----------------------------------------------------------------- the graph
 class ResponseGraph(Gtk.DrawingArea):
     PAD_L, PAD_R, PAD_T, PAD_B = 44, 16, 16, 28
@@ -1537,8 +1772,15 @@ class EQWindow(Adw.ApplicationWindow):
         new.connect("clicked", lambda *_: self.on_new_preset())
         header.pack_start(new)
 
+        imp = Gtk.Button()
+        imp.set_child(Adw.ButtonContent(icon_name="document-open-symbolic", label="Import"))
+        imp.set_tooltip_text("Import a Peace preset, an Equalizer APO file or an AutoEQ file")
+        imp.connect("clicked", lambda *_: self.on_import())
+        header.pack_start(imp)
+
         menu = Gio.Menu()
         menu.append("New preset…", "win.new-preset")
+        menu.append("Import a preset file…", "win.import")
         menu.append("Save as new preset…", "win.save-as")
         menu.append("Delete this preset…", "win.delete-preset")
         menu.append("Flatten all bands", "win.flatten")
@@ -1557,6 +1799,7 @@ class EQWindow(Adw.ApplicationWindow):
 
         self._action("save-as", lambda *_: self.on_save_as())
         self._action("new-preset", lambda *_: self.on_new_preset())
+        self._action("import", lambda *_: self.on_import())
         self._action("donate", lambda *_: self.on_donate())
         self._action("delete-preset", lambda *_: self.on_delete_preset())
         self._action("flatten", lambda *_: self.on_flatten())
@@ -2026,6 +2269,90 @@ class EQWindow(Adw.ApplicationWindow):
             self.ee.save_preset(name)
             self.refresh_presets()
             self.toast(f"Created “{name}”")
+
+        dlg.connect("response", done)
+        dlg.present(self)
+        entry.grab_focus()
+
+    def on_import(self):
+        dlg = Gtk.FileDialog(title="Import a preset file")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        eq = Gtk.FileFilter(name="EQ presets (Peace, Equalizer APO, AutoEQ, REW)")
+        for pat in ("*.peace", "*.PEACE", "*.txt", "*.TXT", "*.cfg"):
+            eq.add_pattern(pat)
+        every = Gtk.FileFilter(name="All files")
+        every.add_pattern("*")
+        filters.append(eq)
+        filters.append(every)
+        dlg.set_filters(filters)
+        dlg.set_default_filter(eq)
+
+        def picked(d, res):
+            try:
+                f = d.open_finish(res)
+            except GLib.Error:
+                return  # cancelled
+            path = f.get_path() if f else None
+            if not path:
+                return
+            try:
+                bands, preamp, notes = import_eq_file(path)
+            except (OSError, ValueError, configparser.Error) as e:
+                self.toast(f"Couldn't import {os.path.basename(path)}: {e}")
+                return
+            self.ask_import_name(path, bands, preamp, notes)
+
+        dlg.open(self, None, picked)
+
+    def ask_import_name(self, path, bands, preamp, notes):
+        stem = clean_name(os.path.splitext(os.path.basename(path))[0]) or "Imported"
+        taken = {n.lower() for n in list_presets()}
+        name, k = stem, 2
+        while name.lower() in taken:
+            name, k = f"{stem} ({k})", k + 1
+        n = len(bands)
+        body = f"{n} band{'s' if n != 1 else ''}, pre-amp {preamp:+.1f} dB. It's saved as a new preset and used right away."
+        if notes:
+            body += "\n\nGood to know:\n" + "\n".join("• " + x[0].upper() + x[1:] for x in notes)
+        dlg = Adw.AlertDialog.new(f"Import “{os.path.basename(path)}”", body)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        entry = Gtk.Entry(text=name, placeholder_text="Preset name", activates_default=True)
+        box.append(entry)
+        warn = Gtk.Label(xalign=0)
+        warn.add_css_class("hint")
+        box.append(warn)
+        dlg.set_extra_child(box)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("import", "Import")
+        dlg.set_response_appearance("import", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("import")
+        dlg.set_close_response("cancel")
+
+        def check(*_):
+            nm = clean_name(entry.get_text())
+            dup = nm.lower() in taken
+            warn.set_label("A preset with that name already exists" if dup else "")
+            dlg.set_response_enabled("import", bool(nm) and not dup)
+
+        entry.connect("changed", check)
+
+        def done(_d, resp):
+            nm = clean_name(entry.get_text())
+            if resp != "import" or not nm:
+                return
+            self._flush()
+            self.clear_flags()
+            self.ee.write_all(bands)
+            self.ee.set_preamp(preamp)
+            self.bands = [dict(b) for b in bands]
+            self.preamp = preamp
+            self.selected = None
+            self.rebuild_rows()
+            self.refresh_preamp()
+            self.graph.queue_draw()
+            self.ee.save_preset(nm)
+            self.refresh_presets()
+            self.toast(f"Imported “{nm}”")
 
         dlg.connect("response", done)
         dlg.present(self)

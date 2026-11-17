@@ -21,6 +21,9 @@ audio itself.
 - **Solo / Mute** a band to hear what it does (listening aids only, never saved).
 - **Presets**: create (start flat or copy the current sound), save, save as and delete. Presets
   are normal EasyEffects presets, so they also show up in EasyEffects.
+- **Import, like Peace**: bring in your Peace presets (`.peace`), Equalizer APO config files,
+  [AutoEQ](https://autoeq.app) headphone corrections (ParametricEQ.txt or GraphicEQ.txt) and
+  REW filter exports.
 - **One big power button**: switches the equalizer on or off, and remembers it across reboots.
   It only touches the equalizer, so anything else you use in EasyEffects keeps working.
 
@@ -137,10 +140,21 @@ stay grouped and never replace a preset you already have:
 Each one has its pre-amp set so it doesn't clip. You can edit or delete them like any other
 preset, and a deleted one won't come back.
 
-### Bringing your Peace preset over
+### Importing presets from Peace, Equalizer APO and AutoEQ
 
-Peace doesn't export a file EasyEffects can read, so copy your bands by hand: click **New**,
-choose *Start flat*, then type each band's frequency, gain, Q and filter type from Peace.
+Click **Import** and pick a file. It becomes a new preset and is used right away.
+
+- **Peace presets** (`.peace`): copy them over from your Windows PC. They live in Equalizer
+  APO's `config` folder, usually `C:\Program Files\EqualizerAPO\config`.
+- **Equalizer APO config files** (`.txt`), including the `peace.txt` file that Peace writes.
+- **AutoEQ** headphone corrections from [autoeq.app](https://autoeq.app): choose
+  *Equalizer APO* and download `ParametricEQ.txt` (best) or `GraphicEQ.txt`.
+- **REW** filter exports (*Export filter settings as text*).
+
+Only the equalizer is imported. Peace's settings for individual speakers, delays and similar
+extras are left out, and the app tells you when that happens. Peace's steep Butterworth and
+Linkwitz-Riley filters become ordinary 12 dB/octave filters, and a GraphicEQ curve is matched
+with 31 bands.
 
 ## Good to know
 
