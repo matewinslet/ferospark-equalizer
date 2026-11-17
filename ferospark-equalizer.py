@@ -342,11 +342,13 @@ class EE7(EEBase):
         self.eq.set_double("input-gain", float(v))
 
     def set_power(self, on):
+        """Switch only the equalizer; other EasyEffects effects keep running."""
+        self.eq.set_boolean("bypass", not on)
         if on:
-            self.eq.set_boolean("bypass", False)
-            self.main.set_boolean("bypass", False)
-        else:
-            self.main.set_boolean("bypass", True)
+            self.main.set_boolean("bypass", False)  # a global bypass would silence it
+
+    def clear_global_bypass(self):
+        self.main.set_boolean("bypass", False)
 
     def add_eq_to_chain(self):
         plugins = self.outputs.get_strv("plugins")
@@ -371,7 +373,7 @@ class EE7(EEBase):
         sec = {}
         for key in ("balance", "input-gain", "output-gain", "pitch-left", "pitch-right"):
             sec[key] = self.eq.get_double(key)
-        sec["bypass"] = self.eq.get_boolean("bypass")
+        sec["bypass"] = False  # on/off is the power button's job, not the preset's
         sec["split-channels"] = self.eq.get_boolean("split-channels")
         sec["mode"] = self.eq.get_string("mode")
         n = self.num_bands()
@@ -624,11 +626,13 @@ class EE8(EEBase):
         self._set([(None, "inputGain", float(v))])
 
     def set_power(self, on):
+        """Switch only the equalizer; other EasyEffects effects keep running."""
+        self._set([(None, "bypass", not on)])
         if on:
-            self._set([(None, "bypass", False)])
-            self._talk(["global_bypass:0\n"])
-        else:
-            self._talk(["global_bypass:1\n"])
+            self._talk(["global_bypass:0\n"])  # a global bypass would silence it
+
+    def clear_global_bypass(self):
+        self._talk(["global_bypass:0\n"])
 
     def add_eq_to_chain(self):
         # The socket can't change the effects list, so load a preset that has an
@@ -664,7 +668,7 @@ class EE8(EEBase):
         n = int(self._num(v["numBands"], 0))
         sec = {"balance": self._num(v["balance"]), "input-gain": self._num(v["inputGain"]),
                "output-gain": self._num(v["outputGain"]), "pitch-left": self._num(v["pitchLeft"]),
-               "pitch-right": self._num(v["pitchRight"]), "bypass": v["bypass"] == "true",
+               "pitch-right": self._num(v["pitchRight"]), "bypass": False,
                "split-channels": v["splitChannels"] == "true",
                "mode": self._label(EE8_EQ_MODES, v["mode"], "IIR"), "num-bands": n}
         keys = ("Frequency", "Gain", "Mode", "Q", "Slope", "Type", "Width")
@@ -718,21 +722,29 @@ def start_ee_service():
         BACKEND.start()
 
 
-# EasyEffects resets its global bypass to False every time the service starts,
-# so the on/off state is kept in our own file and re-applied after a start.
-def saved_power():
+# The power button switches only the equalizer. Its on/off state is kept in our
+# own file and re-applied after EasyEffects starts or a preset is loaded.
+# POWER_MODE 2 = equalizer only; earlier versions switched all of EasyEffects off.
+POWER_MODE = 2
+
+
+def _state():
     try:
         with open(STATE_FILE) as fh:
-            return bool(json.load(fh)["power"])
-    except (OSError, ValueError, KeyError):
-        return True
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def saved_power():
+    return bool(_state().get("power", True))
 
 
 def save_power(on):
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w") as fh:
-        json.dump({"power": bool(on)}, fh)
+        json.dump({"power": bool(on), "mode": POWER_MODE}, fh)
     os.replace(tmp, STATE_FILE)
 
 
@@ -751,6 +763,8 @@ def enforce_power(done=None, timeout=15):
         if ee_running():
             ticks["up"] += 1
             want = saved_power()
+            if ticks["up"] == 1:
+                migrate_power_mode()
             if ee.powered() != want:
                 ee.set_power(want)
         if ticks["up"] >= 8 or ticks["n"] >= timeout * 2:
@@ -762,13 +776,25 @@ def enforce_power(done=None, timeout=15):
     GLib.timeout_add(500, tick)
 
 
+def migrate_power_mode():
+    """Older versions switched ALL of EasyEffects off (global bypass). Now only the
+    equalizer is switched; undo the old global bypass once if we had set it."""
+    st = _state()
+    if st.get("mode") == POWER_MODE or not ee_running():
+        return
+    if not st.get("power", True):
+        BACKEND.clear_global_bypass()
+        BACKEND.set_power(False)
+    save_power(st.get("power", True))
+
+
 def install_autostart():
     """Login entry that restores the saved on/off state (replaces the old
     plain EasyEffects autostart, which always came up ON)."""
     os.makedirs(os.path.dirname(AUTOSTART), exist_ok=True)
     with open(AUTOSTART, "w") as fh:
         fh.write("[Desktop Entry]\nName=Ferospark Equalizer (restore state)\n"
-                 "Comment=Starts EasyEffects if the equalizer was on\n"
+                 "Comment=Starts EasyEffects and restores the equalizer on/off state\n"
                  f"Exec=python3 {os.path.abspath(__file__)} --restore\n"
                  "Icon=io.github.matewinslet.FerosparkEqualizer\nNoDisplay=true\n"
                  "StartupNotify=false\nTerminal=false\nType=Application\n"
@@ -778,10 +804,9 @@ def install_autostart():
 
 
 def restore():
-    """Run at login: EQ was off -> leave EasyEffects stopped; on -> start it ON."""
+    """Run at login: start EasyEffects (its other effects may be in use too) and
+    put the equalizer back on or off as the user left it."""
     if BACKEND is None:
-        return 0
-    if not saved_power() and not ee_running():
         return 0
     if not ee_running():
         start_ee_service()
@@ -1932,6 +1957,15 @@ class EQWindow(Adw.ApplicationWindow):
             return
         self.ee.load_preset(name)
         self.toast(f"Loaded “{name}”")
+        GLib.timeout_add(800, self._reapply_power)
+
+    def _reapply_power(self):
+        want = saved_power()  # not self.power_on: a refresh may already show the preset's state
+        if self.ee.powered() != want:
+            self.ee.set_power(want)
+        self.power_on = want
+        self.refresh_power()
+        return False
 
     def on_save(self, *_):
         name = self.ee.current_preset()
@@ -2101,7 +2135,35 @@ class EQWindow(Adw.ApplicationWindow):
             enforce_power()
             GLib.timeout_add(1500, lambda: (self.refresh_banner(), False)[1])
         elif not self.ee.eq_in_chain():
-            self.ee.add_eq_to_chain()
+            if self.ee.version == 8:
+                self.ask_add_eq_ee8()
+            else:
+                self.ee.add_eq_to_chain()
+
+    def ask_add_eq_ee8(self):
+        dlg = Adw.AlertDialog.new(
+            "Add the equalizer in EasyEffects",
+            "The current EasyEffects setup has no equalizer, and EasyEffects 8 doesn't let other "
+            "apps add one. Open EasyEffects, go to Output, press the button to add an effect and "
+            "choose Equalizer. Your other effects stay as they are.\n\n"
+            "Or start over with a flat equalizer preset instead. That replaces the current "
+            "EasyEffects effects.")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("flat", "Use a flat preset")
+        dlg.add_response("open", "Open EasyEffects")
+        dlg.set_response_appearance("open", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("open")
+        dlg.set_close_response("cancel")
+
+        def done(_d, resp):
+            if resp == "open":
+                self.ee.open_gui()
+            elif resp == "flat":
+                self.ee.add_eq_to_chain()
+                GLib.timeout_add(800, self._reapply_power)
+
+        dlg.connect("response", done)
+        dlg.present(self)
 
     # --- syncing from EasyEffects
     def on_settings_changed(self, *_):
@@ -2228,6 +2290,7 @@ class EQApp(Adw.Application):
             return
         install_autostart()
         install_bundled_presets()
+        migrate_power_mode()
         if not ee_running():
             start_ee_service()
             enforce_power()

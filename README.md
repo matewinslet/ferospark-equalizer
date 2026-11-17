@@ -21,7 +21,8 @@ audio itself.
 - **Solo / Mute** a band to hear what it does (listening aids only, never saved).
 - **Presets**: create (start flat or copy the current sound), save, save as and delete. Presets
   are normal EasyEffects presets, so they also show up in EasyEffects.
-- **One big power button**: the on/off state is remembered across reboots.
+- **One big power button**: switches the equalizer on or off, and remembers it across reboots.
+  It only touches the equalizer, so anything else you use in EasyEffects keeps working.
 
 ## Before you start: EasyEffects is required
 
@@ -145,15 +146,16 @@ choose *Start flat*, then type each band's frequency, gain, Q and filter type fr
 
 - The app starts the EasyEffects background service if it isn't running.
 - It adds a small login entry (`~/.config/autostart/io.github.matewinslet.FerosparkEqualizer-restore.desktop`)
-  that restores the on/off state at login. EasyEffects always turns itself back on when it
-  starts, so this entry is what keeps "off" off. It replaces EasyEffects' own
-  `easyeffects-service.desktop` autostart entry, if you have one.
+  that starts EasyEffects at login and puts the equalizer back on or off as you left it. It
+  replaces EasyEffects' own `easyeffects-service.desktop` autostart entry, if you have one.
+- You can keep using EasyEffects for other effects (compressor, bass enhancer, noise
+  removal…) alongside this app. Ferospark Equalizer only changes the equalizer.
 - Presets live in EasyEffects' own preset folder: `~/.config/easyeffects/output/` for
   EasyEffects 7, `~/.local/share/easyeffects/output/` for EasyEffects 8, and
   `~/.var/app/com.github.wwmm.easyeffects/data/easyeffects/output/` for the Flatpak.
 - With EasyEffects 8, other apps can't change the effects list. If the current preset has no
-  equalizer, **Add equalizer** loads the "Ferospark – Flat" preset instead, which replaces that
-  preset's other effects.
+  equalizer, **Add equalizer** explains how to add it in EasyEffects (your other effects stay),
+  or lets you load the "Ferospark – Flat" preset instead.
 
 ## Support development
 
