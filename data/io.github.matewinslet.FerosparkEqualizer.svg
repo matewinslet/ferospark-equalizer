@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b303b"/>
+      <stop offset="1" stop-color="#14161b"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.02"/>
+    </linearGradient>
+    <linearGradient id="fill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2ec27e" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#2ec27e" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="line" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8ff0a4"/>
+      <stop offset="0.55" stop-color="#57e389"/>
+      <stop offset="1" stop-color="#62a0ea"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-40%" width="140%" height="180%">
+      <feGaussianBlur stdDeviation="2.6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="tile"><rect x="8" y="8" width="112" height="112" rx="26"/></clipPath>
+  </defs>
+
+  <!-- tile -->
+  <rect x="8" y="10" width="112" height="112" rx="26" fill="#000" opacity="0.35"/>
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#bg)"/>
+  <rect x="8.75" y="8.75" width="110.5" height="110.5" rx="25.25" fill="none" stroke="url(#rim)" stroke-width="1.5"/>
+
+  <g clip-path="url(#tile)">
+    <!-- grid -->
+    <g stroke="#ffffff" stroke-opacity="0.06" stroke-width="1">
+      <line x1="8" y1="44" x2="120" y2="44"/>
+      <line x1="8" y1="84" x2="120" y2="84"/>
+      <line x1="36" y1="8" x2="36" y2="120"/>
+      <line x1="64" y1="8" x2="64" y2="120"/>
+      <line x1="92" y1="8" x2="92" y2="120"/>
+    </g>
+    <line x1="8" y1="64" x2="120" y2="64" stroke="#ffffff" stroke-opacity="0.14" stroke-width="1.2"/>
+
+    <!-- response curve: bass shelf, dip, presence peak, treble roll-off -->
+    <path d="M8 40 C 24 40, 30 44, 40 60 S 52 72, 62 68 S 76 42, 86 46 S 98 72, 104 62 S 112 54, 120 90 L 120 120 L 8 120 Z"
+          fill="url(#fill)"/>
+    <path d="M8 40 C 24 40, 30 44, 40 60 S 52 72, 62 68 S 76 42, 86 46 S 98 72, 104 62 S 112 54, 120 90"
+          fill="none" stroke="url(#line)" stroke-width="5" stroke-linecap="round" filter="url(#glow)"/>
+  </g>
+
+  <!-- band nodes -->
+  <circle cx="24" cy="40.6" r="6.5" fill="#62a0ea" stroke="#14161b" stroke-width="2.5"/>
+  <circle cx="58" cy="68.8" r="6.5" fill="#f8e45c" stroke="#14161b" stroke-width="2.5"/>
+  <circle cx="84" cy="45.6" r="6.5" fill="#f66151" stroke="#14161b" stroke-width="2.5"/>
+  <circle cx="104" cy="62" r="6.5" fill="#dc8add" stroke="#14161b" stroke-width="2.5"/>
+</svg>
