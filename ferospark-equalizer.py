@@ -9,6 +9,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 
 import gi
 
@@ -22,9 +23,8 @@ GLib.set_prgname("io.github.matewinslet.FerosparkEqualizer")  # window class, so
 GLib.set_application_name("Ferospark Equalizer")
 from gi.repository import Adw, Gdk, Gio, Gtk, Pango  # noqa: E402
 
-EE = "com.github.wwmm.easyeffects"
 EQ_PATH = "/com/github/wwmm/easyeffects/streamoutputs/equalizer/0/"
-PRESET_DIR = os.path.expanduser("~/.config/easyeffects/output")
+PRESET_DIR = os.path.expanduser("~/.config/easyeffects/output")  # replaced by the backend
 AUTOSTART = os.path.expanduser("~/.config/autostart/io.github.matewinslet.FerosparkEqualizer-restore.desktop")
 OLD_AUTOSTART = os.path.expanduser("~/.config/autostart/easyeffects-service.desktop")
 STATE_FILE = os.path.expanduser("~/.config/ferospark-equalizer/state.json")
@@ -169,22 +169,553 @@ def band_response(band):
 
 
 # ------------------------------------------------------------ EasyEffects I/O
-def ee_running():
+# Two ways to talk to EasyEffects:
+#   EasyEffects 7 (GTK): its GSettings keys.
+#   EasyEffects 8 (Qt):  its local socket "EasyEffectsServer" (8.2.8+ can set and
+#                        read every equalizer value through it).
+EE_APP_ID = "com.github.wwmm.easyeffects"
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+XDG_DATA = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+FLATPAK_DATA = os.path.expanduser(f"~/.var/app/{EE_APP_ID}")
+
+
+def flatpak_has_ee():
+    return any(os.path.isdir(os.path.join(d, EE_APP_ID)) for d in (
+        os.path.expanduser("~/.local/share/flatpak/app"), "/var/lib/flatpak/app"))
+
+
+def read_kconfig(path):
+    """Tiny reader for KDE config files: {"Group": {"key": "value"}}."""
+    groups, cur = {}, None
     try:
-        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-        res = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
-                            "org.freedesktop.DBus", "NameHasOwner",
-                            GLib.Variant("(s)", (EE,)), GLib.VariantType("(b)"),
-                            Gio.DBusCallFlags.NONE, -1, None)
-        return res.unpack()[0]
-    except GLib.Error:
-        return False
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if line.startswith("["):
+                    cur = groups.setdefault(line.strip("[]").replace("][", "/"), {})
+                elif cur is not None and "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    cur[k.split("[")[0].strip()] = v
+    except OSError:
+        pass
+    return groups
+
+
+class EEBase:
+    version = 0
+
+    def eq_section(self):
+        raise NotImplementedError
+
+    def _after_save(self, name):
+        pass
+
+    def save_preset(self, name):
+        """Write the current EQ into a preset, keeping any other effects it has."""
+        os.makedirs(self.preset_dir, exist_ok=True)
+        path = os.path.join(self.preset_dir, name + ".json")
+        base_path = path if os.path.exists(path) else os.path.join(
+            self.preset_dir, self.current_preset() + ".json")
+        data = {"output": {"blocklist": [], "plugins_order": []}}
+        try:
+            with open(base_path) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            pass
+        out = data.setdefault("output", {})
+        order = out.setdefault("plugins_order", [])
+        if "equalizer#0" not in order:
+            order.append("equalizer#0")
+        out.setdefault("blocklist", [])
+        out["equalizer#0"] = self.eq_section()
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=4)
+        os.replace(tmp, path)
+        self._after_save(name)
+
+    def problem(self):
+        """A reason the EQ can't be controlled right now, or None."""
+        return None
+
+
+class EE7(EEBase):
+    """EasyEffects 7.x (GTK version): everything lives in GSettings."""
+    version = 7
+    preset_dir = os.path.join(XDG_CONFIG, "easyeffects", "output")
+    config_dir = os.path.join(XDG_CONFIG, "easyeffects")
+
+    def __init__(self):
+        self.main = Gio.Settings.new(EE_APP_ID)
+        self.outputs = Gio.Settings.new(EE_APP_ID + ".streamoutputs")
+        self.eq = Gio.Settings.new_with_path(EE_APP_ID + ".equalizer", EQ_PATH)
+        self.left = Gio.Settings.new_with_path(EE_APP_ID + ".equalizer.channel", EQ_PATH + "leftchannel/")
+        self.right = Gio.Settings.new_with_path(EE_APP_ID + ".equalizer.channel", EQ_PATH + "rightchannel/")
+
+    # --- the EasyEffects process
+    def running(self):
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            res = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                "org.freedesktop.DBus", "NameHasOwner",
+                                GLib.Variant("(s)", (EE_APP_ID,)), GLib.VariantType("(b)"),
+                                Gio.DBusCallFlags.NONE, -1, None)
+            return res.unpack()[0]
+        except GLib.Error:
+            return False
+
+    def start(self):
+        subprocess.Popen(["easyeffects", "--gapplication-service"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+
+    def open_gui(self):
+        subprocess.Popen(["easyeffects"], start_new_session=True)
+
+    def watch(self, cb):
+        for s in (self.eq, self.left, self.main, self.outputs):
+            s.connect("changed", cb)
+
+    # --- reading
+    def num_bands(self):
+        return self.eq.get_int("num-bands")
+
+    def bands(self):
+        out = []
+        for i in range(self.num_bands()):
+            p = f"band{i}-"
+            out.append({
+                "type": self.left.get_string(p + "type"),
+                "frequency": self.left.get_double(p + "frequency"),
+                "gain": self.left.get_double(p + "gain"),
+                "q": self.left.get_double(p + "q"),
+            })
+        return out
+
+    def preamp(self):
+        return self.eq.get_double("input-gain")
+
+    def powered(self):
+        return not self.main.get_boolean("bypass") and not self.eq.get_boolean("bypass")
+
+    def eq_in_chain(self):
+        return "equalizer#0" in self.outputs.get_strv("plugins")
+
+    def band_flags(self):
+        n = self.num_bands()
+        muted = {i for i in range(n) if self.left.get_boolean(f"band{i}-mute")}
+        soloed = {i for i in range(n) if self.left.get_boolean(f"band{i}-solo")}
+        return muted, soloed
+
+    def output_device(self):
+        return (self.outputs.get_string("output-device"),
+                self.outputs.get_boolean("use-default-output-device"))
+
+    # --- writing
+    def write_band(self, i, band, full=False):
+        p = f"band{i}-"
+        for ch in (self.left, self.right):
+            ch.set_string(p + "type", band["type"])
+            ch.set_double(p + "frequency", float(band["frequency"]))
+            ch.set_double(p + "gain", float(band["gain"]))
+            ch.set_double(p + "q", float(band["q"]))
+            if full:
+                ch.set_string(p + "mode", "APO (DR)")
+                ch.set_string(p + "slope", "x1")
+                ch.set_boolean(p + "mute", False)
+                ch.set_boolean(p + "solo", False)
+
+    def set_band_flag(self, i, key, on):
+        for ch in (self.left, self.right):
+            ch.set_boolean(f"band{i}-{key}", bool(on))
+
+    def set_num_bands(self, n):
+        self.eq.set_int("num-bands", n)
+
+    def write_all(self, bands):
+        for i, b in enumerate(bands):
+            self.write_band(i, b, full=True)
+        self.set_num_bands(len(bands))
+
+    def set_preamp(self, v):
+        self.eq.set_double("input-gain", float(v))
+
+    def set_power(self, on):
+        if on:
+            self.eq.set_boolean("bypass", False)
+            self.main.set_boolean("bypass", False)
+        else:
+            self.main.set_boolean("bypass", True)
+
+    def add_eq_to_chain(self):
+        plugins = self.outputs.get_strv("plugins")
+        if "equalizer#0" not in plugins:
+            self.outputs.set_strv("plugins", plugins + ["equalizer#0"])
+
+    # --- presets
+    def current_preset(self):
+        return self.main.get_string("last-used-output-preset")
+
+    def forget_current_preset(self):
+        self.main.set_string("last-used-output-preset", "")
+
+    def load_preset(self, name):
+        subprocess.Popen(["easyeffects", "-l", name], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _after_save(self, name):
+        self.main.set_string("last-used-output-preset", name)
+
+    def eq_section(self):
+        sec = {}
+        for key in ("balance", "input-gain", "output-gain", "pitch-left", "pitch-right"):
+            sec[key] = self.eq.get_double(key)
+        sec["bypass"] = self.eq.get_boolean("bypass")
+        sec["split-channels"] = self.eq.get_boolean("split-channels")
+        sec["mode"] = self.eq.get_string("mode")
+        n = self.num_bands()
+        sec["num-bands"] = n
+        for name, ch in (("left", self.left), ("right", self.right)):
+            chan = {}
+            for i in range(n):
+                p = f"band{i}-"
+                chan[f"band{i}"] = {
+                    "frequency": ch.get_double(p + "frequency"),
+                    "gain": ch.get_double(p + "gain"),
+                    "mode": ch.get_string(p + "mode"),
+                    "mute": False,  # solo/mute are for listening only, never saved
+                    "q": ch.get_double(p + "q"),
+                    "slope": ch.get_string(p + "slope"),
+                    "solo": False,
+                    "type": ch.get_string(p + "type"),
+                    "width": ch.get_double(p + "width"),
+                }
+            sec[name] = chan
+        return sec
+
+
+# EasyEffects 8 stores choices as list positions; these are its label lists.
+EE8_BAND_TYPES = ["Off", "Bell", "Hi-pass", "Hi-shelf", "Lo-pass", "Lo-shelf", "Notch",
+                  "Resonance", "Allpass", "Bandpass", "Ladder-pass", "Ladder-rej"]
+EE8_BAND_MODES = ["RLC (BT)", "RLC (MT)", "BWC (BT)", "BWC (MT)", "LRX (BT)", "LRX (MT)", "APO (DR)"]
+EE8_SLOPES = ["x1", "x2", "x3", "x4"]
+EE8_EQ_MODES = ["IIR", "FIR", "FFT", "SPM", "MP FIR", "MP FFT", "MP SPM"]
+
+
+class EE8(EEBase):
+    """EasyEffects 8.x (Qt version), native package or Flatpak, through its local socket."""
+    version = 8
+    EQ = "output:equalizer:0"
+
+    def __init__(self, flatpak=False):
+        self.flatpak = flatpak
+        if flatpak:
+            self.cmd = ["flatpak", "run", EE_APP_ID]
+            self.config_dir = os.path.join(FLATPAK_DATA, "config", "easyeffects")
+            self.preset_dir = os.path.join(FLATPAK_DATA, "data", "easyeffects", "output")
+            self.sock_path = os.path.join(RUNTIME_DIR, ".flatpak", EE_APP_ID, "tmp", "EasyEffectsServer")
+        else:
+            self.cmd = ["easyeffects"]
+            self.config_dir = os.path.join(XDG_CONFIG, "easyeffects")
+            self.preset_dir = os.path.join(XDG_DATA, "easyeffects", "output")
+            self.sock_path = os.path.join(RUNTIME_DIR, "EasyEffectsServer")
+        self._monitor = None
+        self._sock = None
+
+    # --- socket (one connection kept open, so commands arrive in order)
+    def _connect(self):
+        import socket
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        for attempt in range(25):  # queue full right now: wait a moment
+            try:
+                s.connect(self.sock_path)
+                return s
+            except BlockingIOError:
+                time.sleep(0.01)
+            except OSError:
+                s.close()
+                raise
+        s.close()
+        raise OSError("EasyEffects socket busy")
+
+    def _drop(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+    def _talk(self, lines, replies=0, raw=False):
+        """Send command lines; return `replies` answer lines (None on failure)."""
+        for attempt in (0, 1):  # second try with a fresh connection (EasyEffects restarted)
+            try:
+                if self._sock is None:
+                    self._sock = self._connect()
+                s = self._sock
+                if lines:
+                    s.sendall("".join(lines).encode())
+                if not replies:
+                    return []
+                buf = b""
+                while True:
+                    if raw and buf:
+                        return [buf.decode(errors="replace")]
+                    if not raw and buf.count(b"\n") >= replies:
+                        break
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        raise ConnectionResetError
+                    buf += chunk
+                return buf.decode(errors="replace").split("\n")[:replies]
+            except TimeoutError:
+                self._drop()  # no answer (EasyEffects too old?); late replies would confuse us
+                return None
+            except OSError:
+                self._drop()
+                if attempt:
+                    return None
+        return None
+
+    def _get(self, props):
+        """props: [(channel or None, name)] on equalizer #0 -> list of strings."""
+        lines = [f"get_property:{self.EQ}:{ch + ':' if ch else ''}{name}\n" for ch, name in props]
+        return self._talk(lines, len(lines))
+
+    def _set(self, props):
+        """props: [(channel or None, name, value)]."""
+        def fmt(v):
+            if isinstance(v, bool):
+                return "true" if v else "false"
+            return repr(float(v)) if isinstance(v, float) else str(v)
+        self._talk([f"set_property:{self.EQ}:{ch + ':' if ch else ''}{name}:{fmt(v)}\n"
+                    for ch, name, v in props])
+
+    @staticmethod
+    def _num(txt, default=0.0):
+        try:
+            return float(txt)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _label(labels, txt, default):
+        try:
+            return labels[int(txt)]
+        except (TypeError, ValueError, IndexError):
+            return default
+
+    # --- the EasyEffects process
+    def running(self):
+        try:
+            self._connect().close()
+            return True
+        except OSError:
+            return False
+
+    def problem(self):
+        if not self.running():
+            return None
+        ans = self._get([("left", "band0Gain")])
+        if ans is None:
+            return "This EasyEffects 8 is too old. Please update it to 8.2.8 or newer"
+        return None
+
+    def start(self):
+        subprocess.Popen(self.cmd + ["--service-mode", "--hide-window"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+
+    def open_gui(self):
+        subprocess.Popen(self.cmd, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def watch(self, cb):
+        # EasyEffects 8 writes its settings to files in config_dir/db; watch them
+        # instead of polling the socket.
+        db = os.path.join(self.config_dir, "db")
+        os.makedirs(db, exist_ok=True)
+        self._monitor = Gio.File.new_for_path(db).monitor_directory(Gio.FileMonitorFlags.NONE, None)
+        self._monitor.connect("changed", lambda *_: cb())
+
+    def _rc(self):
+        return read_kconfig(os.path.join(self.config_dir, "db", "easyeffectsrc"))
+
+    # --- reading
+    def num_bands(self):
+        ans = self._get([(None, "numBands")])
+        return int(self._num(ans[0], 0)) if ans else 0
+
+    def bands(self):
+        n = self.num_bands()
+        props = [("left", f"band{i}{k}") for i in range(n) for k in ("Type", "Frequency", "Gain", "Q")]
+        ans = self._get(props) if n else []
+        if ans is None:
+            return []
+        out = []
+        for i in range(n):
+            t, f, g, q = ans[i * 4:i * 4 + 4]
+            out.append({"type": self._label(EE8_BAND_TYPES, t, "Bell"),
+                        "frequency": self._num(f, 1000.0), "gain": self._num(g), "q": self._num(q, 1.0)})
+        return out
+
+    def preamp(self):
+        ans = self._get([(None, "inputGain")])
+        return self._num(ans[0]) if ans else 0.0
+
+    def powered(self):
+        g = self._talk(["get_global_bypass\n"], 1, raw=True)
+        eq = self._get([(None, "bypass")])
+        global_off = bool(g) and g[0].strip().startswith("1")
+        eq_off = bool(eq) and eq[0].strip() == "true"
+        return not global_off and not eq_off
+
+    def eq_in_chain(self):
+        plugins = self._rc().get("StreamOutputs", {}).get("plugins")
+        if plugins is not None:
+            return "equalizer#0" in plugins.replace("\\,", "\0").split(",")
+        ans = self._get([(None, "bypass")])
+        return bool(ans) and not ans[0].startswith("error")
+
+    def band_flags(self):
+        n = self.num_bands()
+        ans = self._get([("left", f"band{i}{k}") for i in range(n) for k in ("Mute", "Solo")]) if n else []
+        if not ans:
+            return set(), set()
+        muted = {i for i in range(n) if ans[i * 2] == "true"}
+        soloed = {i for i in range(n) if ans[i * 2 + 1] == "true"}
+        return muted, soloed
+
+    def output_device(self):
+        so = self._rc().get("StreamOutputs", {})
+        return so.get("outputDevice", ""), so.get("useDefaultOutputDevice", "true") != "false"
+
+    # --- writing
+    @staticmethod
+    def _band_props(i, band, full=False):
+        t = EE8_BAND_TYPES.index(band["type"]) if band["type"] in EE8_BAND_TYPES else 1
+        props = []
+        for ch in ("left", "right"):
+            props += [(ch, f"band{i}Type", t), (ch, f"band{i}Frequency", float(band["frequency"])),
+                      (ch, f"band{i}Gain", float(band["gain"])), (ch, f"band{i}Q", float(band["q"]))]
+            if full:
+                props += [(ch, f"band{i}Mode", EE8_BAND_MODES.index("APO (DR)")),
+                          (ch, f"band{i}Slope", 0), (ch, f"band{i}Mute", False),
+                          (ch, f"band{i}Solo", False)]
+        return props
+
+    def write_band(self, i, band, full=False):
+        self._set(self._band_props(i, band, full))
+
+    def set_band_flag(self, i, key, on):
+        k = key.capitalize()
+        self._set([(ch, f"band{i}{k}", bool(on)) for ch in ("left", "right")])
+
+    def set_num_bands(self, n):
+        self._set([(None, "numBands", int(n))])
+
+    def write_all(self, bands):
+        props = [p for i, b in enumerate(bands) for p in self._band_props(i, b, full=True)]
+        self._set(props + [(None, "numBands", len(bands))])  # one connection
+
+    def set_preamp(self, v):
+        self._set([(None, "inputGain", float(v))])
+
+    def set_power(self, on):
+        if on:
+            self._set([(None, "bypass", False)])
+            self._talk(["global_bypass:0\n"])
+        else:
+            self._talk(["global_bypass:1\n"])
+
+    def add_eq_to_chain(self):
+        # The socket can't change the effects list, so load a preset that has an
+        # equalizer (our own flat one).
+        name = PRESET_PREFIX + "Flat"
+        dst = os.path.join(self.preset_dir, name + ".json")
+        if not os.path.exists(dst):
+            os.makedirs(self.preset_dir, exist_ok=True)
+            with open(os.path.join(BUNDLED_PRESETS, name + ".json"), "rb") as src, open(dst, "wb") as out:
+                out.write(src.read())
+        self.load_preset(name)
+
+    # --- presets
+    def current_preset(self):
+        ans = self._talk(["get_last_loaded_preset:output\n"], 1)
+        return ans[0].strip() if ans else ""
+
+    def forget_current_preset(self):
+        pass  # EasyEffects 8 has no way to clear it from outside
+
+    def load_preset(self, name):
+        self._talk([f"load_preset:output:{name[:100]}\n"])
+
+    def _after_save(self, name):
+        if name != self.current_preset():
+            self.load_preset(name)  # same sound; makes it the current preset
+
+    def eq_section(self):
+        top = ["balance", "inputGain", "outputGain", "pitchLeft", "pitchRight",
+               "bypass", "splitChannels", "mode", "numBands"]
+        a = self._get([(None, k) for k in top]) or [""] * len(top)
+        v = dict(zip(top, a))
+        n = int(self._num(v["numBands"], 0))
+        sec = {"balance": self._num(v["balance"]), "input-gain": self._num(v["inputGain"]),
+               "output-gain": self._num(v["outputGain"]), "pitch-left": self._num(v["pitchLeft"]),
+               "pitch-right": self._num(v["pitchRight"]), "bypass": v["bypass"] == "true",
+               "split-channels": v["splitChannels"] == "true",
+               "mode": self._label(EE8_EQ_MODES, v["mode"], "IIR"), "num-bands": n}
+        keys = ("Frequency", "Gain", "Mode", "Q", "Slope", "Type", "Width")
+        for ch in ("left", "right"):
+            a = self._get([(ch, f"band{i}{k}") for i in range(n) for k in keys]) or [""] * (n * len(keys))
+            chan = {}
+            for i in range(n):
+                f, g, m, q, sl, t, w = a[i * 7:i * 7 + 7]
+                chan[f"band{i}"] = {
+                    "frequency": self._num(f, 1000.0), "gain": self._num(g),
+                    "mode": self._label(EE8_BAND_MODES, m, "APO (DR)"), "mute": False,
+                    "q": self._num(q, 1.0), "slope": self._label(EE8_SLOPES, sl, "x1"),
+                    "solo": False, "type": self._label(EE8_BAND_TYPES, t, "Bell"),
+                    "width": self._num(w, 4.0)}
+            sec[ch] = chan
+        return sec
+
+
+def detect_backend():
+    """EasyEffects 7 if its settings schema is installed, otherwise EasyEffects 8
+    (native first, then Flatpak). None when EasyEffects isn't installed at all."""
+    import shutil
+    src = Gio.SettingsSchemaSource.get_default()
+    has7 = src is not None and src.lookup(EE_APP_ID, True) is not None
+    if has7 and shutil.which("easyeffects"):
+        return EE7()
+    native, flat = shutil.which("easyeffects"), flatpak_has_ee()
+    if native and flat:  # both installed: the one running, else the Flatpak (usually newer)
+        nb = EE8(flatpak=False)
+        return nb if nb.running() else EE8(flatpak=True)
+    if native:
+        return EE8(flatpak=False)
+    if flat:
+        return EE8(flatpak=True)
+    if has7:
+        return EE7()
+    return None
+
+
+BACKEND = detect_backend()
+if BACKEND is not None:
+    PRESET_DIR = BACKEND.preset_dir
+
+
+def ee_running():
+    return BACKEND is not None and BACKEND.running()
 
 
 def start_ee_service():
-    subprocess.Popen(["easyeffects", "--gapplication-service"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+    if BACKEND is not None:
+        BACKEND.start()
 
 
 # EasyEffects resets its global bypass to False every time the service starts,
@@ -208,7 +739,11 @@ def save_power(on):
 def enforce_power(done=None, timeout=15):
     """Wait for EasyEffects to come up, then keep re-applying the saved power
     state for a few seconds (its startup reset can land after our first write)."""
-    ee = EEState()
+    ee = BACKEND
+    if ee is None:
+        if done:
+            done()
+        return
     ticks = {"n": 0, "up": 0}
 
     def tick():
@@ -244,6 +779,8 @@ def install_autostart():
 
 def restore():
     """Run at login: EQ was off -> leave EasyEffects stopped; on -> start it ON."""
+    if BACKEND is None:
+        return 0
     if not saved_power() and not ee_running():
         return 0
     if not ee_running():
@@ -294,137 +831,6 @@ def list_presets():
     except FileNotFoundError:
         names = []
     return sorted(names, key=str.lower)
-
-
-class EEState:
-    def __init__(self):
-        self.main = Gio.Settings.new(EE)
-        self.outputs = Gio.Settings.new(EE + ".streamoutputs")
-        self.eq = Gio.Settings.new_with_path(EE + ".equalizer", EQ_PATH)
-        self.left = Gio.Settings.new_with_path(EE + ".equalizer.channel", EQ_PATH + "leftchannel/")
-        self.right = Gio.Settings.new_with_path(EE + ".equalizer.channel", EQ_PATH + "rightchannel/")
-
-    # --- reading
-    def bands(self):
-        n = self.eq.get_int("num-bands")
-        out = []
-        for i in range(n):
-            p = f"band{i}-"
-            out.append({
-                "type": self.left.get_string(p + "type"),
-                "frequency": self.left.get_double(p + "frequency"),
-                "gain": self.left.get_double(p + "gain"),
-                "q": self.left.get_double(p + "q"),
-            })
-        return out
-
-    def preamp(self):
-        return self.eq.get_double("input-gain")
-
-    def powered(self):
-        return not self.main.get_boolean("bypass") and not self.eq.get_boolean("bypass")
-
-    def eq_in_chain(self):
-        return "equalizer#0" in self.outputs.get_strv("plugins")
-
-    # --- writing
-    def write_band(self, i, band, full=False):
-        p = f"band{i}-"
-        for ch in (self.left, self.right):
-            ch.set_string(p + "type", band["type"])
-            ch.set_double(p + "frequency", float(band["frequency"]))
-            ch.set_double(p + "gain", float(band["gain"]))
-            ch.set_double(p + "q", float(band["q"]))
-            if full:
-                ch.set_string(p + "mode", "APO (DR)")
-                ch.set_string(p + "slope", "x1")
-                ch.set_boolean(p + "mute", False)
-                ch.set_boolean(p + "solo", False)
-
-    def band_flags(self):
-        n = self.eq.get_int("num-bands")
-        muted = {i for i in range(n) if self.left.get_boolean(f"band{i}-mute")}
-        soloed = {i for i in range(n) if self.left.get_boolean(f"band{i}-solo")}
-        return muted, soloed
-
-    def set_band_flag(self, i, key, on):
-        for ch in (self.left, self.right):
-            ch.set_boolean(f"band{i}-{key}", bool(on))
-
-    def write_all(self, bands):
-        for i, b in enumerate(bands):
-            self.write_band(i, b, full=True)
-        self.eq.set_int("num-bands", len(bands))
-
-    def set_preamp(self, v):
-        self.eq.set_double("input-gain", float(v))
-
-    def set_power(self, on):
-        if on:
-            self.eq.set_boolean("bypass", False)
-            self.main.set_boolean("bypass", False)
-        else:
-            self.main.set_boolean("bypass", True)
-
-    def add_eq_to_chain(self):
-        plugins = self.outputs.get_strv("plugins")
-        if "equalizer#0" not in plugins:
-            self.outputs.set_strv("plugins", plugins + ["equalizer#0"])
-
-    # --- presets
-    def current_preset(self):
-        return self.main.get_string("last-used-output-preset")
-
-    def eq_section(self):
-        sec = {}
-        for key in ("balance", "input-gain", "output-gain", "pitch-left", "pitch-right"):
-            sec[key] = self.eq.get_double(key)
-        sec["bypass"] = self.eq.get_boolean("bypass")
-        sec["split-channels"] = self.eq.get_boolean("split-channels")
-        sec["mode"] = self.eq.get_string("mode")
-        n = self.eq.get_int("num-bands")
-        sec["num-bands"] = n
-        for name, ch in (("left", self.left), ("right", self.right)):
-            chan = {}
-            for i in range(n):
-                p = f"band{i}-"
-                chan[f"band{i}"] = {
-                    "frequency": ch.get_double(p + "frequency"),
-                    "gain": ch.get_double(p + "gain"),
-                    "mode": ch.get_string(p + "mode"),
-                    "mute": False,  # solo/mute are for listening only, never saved
-                    "q": ch.get_double(p + "q"),
-                    "slope": ch.get_string(p + "slope"),
-                    "solo": False,
-                    "type": ch.get_string(p + "type"),
-                    "width": ch.get_double(p + "width"),
-                }
-            sec[name] = chan
-        return sec
-
-    def save_preset(self, name):
-        """Write the current EQ into a preset, keeping any other effects it has."""
-        os.makedirs(PRESET_DIR, exist_ok=True)
-        path = os.path.join(PRESET_DIR, name + ".json")
-        base_path = path if os.path.exists(path) else os.path.join(
-            PRESET_DIR, self.current_preset() + ".json")
-        data = {"output": {"blocklist": [], "plugins_order": []}}
-        try:
-            with open(base_path) as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            pass
-        out = data.setdefault("output", {})
-        order = out.setdefault("plugins_order", [])
-        if "equalizer#0" not in order:
-            order.append("equalizer#0")
-        out.setdefault("blocklist", [])
-        out["equalizer#0"] = self.eq_section()
-        tmp = path + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(data, fh, indent=4)
-        os.replace(tmp, path)
-        self.main.set_string("last-used-output-preset", name)
 
 
 # ----------------------------------------------------------------- the graph
@@ -930,8 +1336,8 @@ class BandInspector(Gtk.Box):
 # ------------------------------------------------------------ clip detection
 def output_sink(ee):
     """The real device EasyEffects plays into (where clipping would happen)."""
-    dev = ee.outputs.get_string("output-device")
-    if ee.outputs.get_boolean("use-default-output-device"):
+    dev, use_default = ee.output_device()
+    if use_default:
         try:
             d = subprocess.run(["pactl", "get-default-sink"], capture_output=True,
                                text=True, timeout=2).stdout.strip()
@@ -1068,7 +1474,7 @@ class EQWindow(Adw.ApplicationWindow):
         super().__init__(application=app, title="Ferospark Equalizer")
         self.add_css_class("eqpanel")
         self.set_default_size(1180, 840)
-        self.ee = EEState()
+        self.ee = BACKEND
         self.bands = self.ee.bands()
         self.preamp = self.ee.preamp()
         self.power_on = self.ee.powered()
@@ -1130,7 +1536,7 @@ class EQWindow(Adw.ApplicationWindow):
         self._action("delete-preset", lambda *_: self.on_delete_preset())
         self._action("flatten", lambda *_: self.on_flatten())
         self._action("auto-preamp", lambda *_: self.on_auto_preamp())
-        self._action("open-ee", lambda *_: subprocess.Popen(["easyeffects"], start_new_session=True))
+        self._action("open-ee", lambda *_: self.ee.open_gui())
 
         # body
         scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
@@ -1284,14 +1690,27 @@ class EQWindow(Adw.ApplicationWindow):
 
 
         # external changes (preset loaded elsewhere, EasyEffects UI, etc.)
-        for s in (self.ee.eq, self.ee.left, self.ee.main, self.ee.outputs):
-            s.connect("changed", self.on_settings_changed)
+        self.ee.watch(self.on_settings_changed)
 
         # pick up presets added or removed on disk
         self.preset_monitor = Gio.File.new_for_path(PRESET_DIR).monitor_directory(
             Gio.FileMonitorFlags.NONE, None)
         self.preset_monitor.connect(
             "changed", lambda *_: GLib.timeout_add(300, lambda: (self.refresh_presets(), False)[1]))
+
+        if self.ee.version == 8 and not self.ee.running():
+            tries = {"n": 0}
+
+            def wait_ee():
+                tries["n"] += 1
+                if self.ee.running():
+                    self.clear_flags()
+                    self._refresh()
+                    self.refresh_presets()
+                    return False
+                return tries["n"] < 20
+
+            GLib.timeout_add(500, wait_ee)
 
         self.clear_flags()  # stale solo/mute from an earlier session
         self.rebuild_rows()
@@ -1362,7 +1781,7 @@ class EQWindow(Adw.ApplicationWindow):
     def _flush(self):
         pending, self._pending = self._pending, {}
         for i, b in pending.items():
-            if i < self.ee.eq.get_int("num-bands"):
+            if i < self.ee.num_bands():
                 self.ee.write_band(i, b)
         self._flush_id = 0
         return False
@@ -1375,7 +1794,7 @@ class EQWindow(Adw.ApplicationWindow):
         new = {"type": "Bell", "frequency": 1000.0, "gain": 0.0, "q": 1.0}
         self.bands.append(new)
         self.ee.write_band(len(self.bands) - 1, new, full=True)
-        self.ee.eq.set_int("num-bands", len(self.bands))
+        self.ee.set_num_bands(len(self.bands))
         self.rebuild_rows()
         self.select_band(len(self.bands) - 1)
 
@@ -1511,8 +1930,7 @@ class EQWindow(Adw.ApplicationWindow):
         name = item.get_string()
         if name == self.ee.current_preset():
             return
-        subprocess.Popen(["easyeffects", "-l", name], start_new_session=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.ee.load_preset(name)
         self.toast(f"Loaded “{name}”")
 
     def on_save(self, *_):
@@ -1670,7 +2088,7 @@ class EQWindow(Adw.ApplicationWindow):
                 self.toast(f"Couldn't delete: {e.message}")
                 return
             if self.ee.current_preset() == name:
-                self.ee.main.set_string("last-used-output-preset", "")
+                self.ee.forget_current_preset()
             self.refresh_presets()
             self.toast(f"Deleted “{name}” (it's in the Trash)")
 
@@ -1776,7 +2194,12 @@ class EQWindow(Adw.ApplicationWindow):
             self.clip_label.set_label(f"Loudest point {peak:+.1f} dB — no clipping")
 
     def refresh_banner(self):
-        if not ee_running():
+        problem = self.ee.problem()
+        if problem:
+            self.banner.set_title(problem)
+            self.banner.set_button_label(None)
+            self.banner.set_revealed(True)
+        elif not ee_running():
             self.banner.set_title("EasyEffects isn't running, so the EQ isn't active")
             self.banner.set_button_label("Start it")
             self.banner.set_revealed(True)
@@ -1801,6 +2224,8 @@ class EQApp(Adw.Application):
         prov.load_from_string(CSS)
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        if BACKEND is None:
+            return
         install_autostart()
         install_bundled_presets()
         if not ee_running():
@@ -1808,8 +2233,31 @@ class EQApp(Adw.Application):
             enforce_power()
 
     def do_activate(self):
-        win = self.get_active_window() or EQWindow(self)
+        win = self.get_active_window()
+        if win is None:
+            win = EQWindow(self) if BACKEND is not None else self.missing_ee_window()
         win.present()
+
+    def missing_ee_window(self):
+        win = Adw.ApplicationWindow(application=self, title="Ferospark Equalizer")
+        win.set_default_size(560, 460)
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+        page = Adw.StatusPage(
+            icon_name="audio-speakers-symbolic", title="EasyEffects is needed",
+            description="Ferospark Equalizer controls the equalizer inside EasyEffects, "
+                        "which does the actual sound processing. Install EasyEffects first "
+                        "(for example: sudo apt install easyeffects), then open this app again.")
+        btn = Gtk.Button(label="Open install instructions", halign=Gtk.Align.CENTER)
+        btn.add_css_class("pill")
+        btn.add_css_class("suggested-action")
+        btn.connect("clicked", lambda *_: Gtk.UriLauncher.new(
+            "https://github.com/matewinslet/ferospark-equalizer#before-you-start-easyeffects-is-required"
+        ).launch(win, None, None, None))
+        page.set_child(btn)
+        tv.set_content(page)
+        win.set_content(tv)
+        return win
 
 
 if __name__ == "__main__":

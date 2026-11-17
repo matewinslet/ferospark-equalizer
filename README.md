@@ -27,41 +27,58 @@ audio itself.
 
 Ferospark Equalizer does **not** process sound by itself. The sound is processed by
 **EasyEffects**, and this app controls it. **Without EasyEffects installed, the app will not work.**
+If you open the app without it, it tells you so and links back here.
 
-It needs **EasyEffects version 7** (7.x) from your distribution's normal package manager:
+Both EasyEffects versions in use today are supported:
 
-- **Not the Flatpak or Flathub version.** That one runs sandboxed and is already version 8, so
-  this app can't reach it.
-- **Not EasyEffects 8.** Version 8 was rebuilt with a different toolkit and stores its settings
-  differently, so it isn't supported yet.
+| EasyEffects | Supported |
+|---|---|
+| **7.x** (the older GTK version) | Yes |
+| **8.2.8 or newer** (the current Qt version), as a normal package or a Flatpak | Yes (new, please [report problems](https://github.com/matewinslet/ferospark-equalizer/issues)) |
+| 8.0 to 8.2.7 | No: these can't be controlled by other apps yet. Update EasyEffects. |
 
 Your computer also needs to use **PipeWire** for sound. Almost every desktop Linux released since
 2022 does.
 
 ### Step 1: install EasyEffects
 
-**Ubuntu 24.04 / 25.10, Zorin OS 18, Linux Mint 22, Pop!_OS 24.04, Debian 13 and other
-distributions based on these:** open a terminal and run
+Use whichever of these matches your system. Your distribution's own package is the best choice.
+
+**Ubuntu, Zorin OS, Linux Mint, Pop!_OS, Debian and similar:** open a terminal and run
 
 ```bash
 sudo apt update
 sudo apt install easyeffects
 ```
 
-**Fedora 42:**
+**Fedora:**
 
 ```bash
 sudo dnf install easyeffects
 ```
 
-Then check the version:
+**Arch, Manjaro, EndeavourOS:**
+
+```bash
+sudo pacman -S easyeffects
+```
+
+**Any distribution, through Flatpak.** Use this if your distribution's EasyEffects is 8.0 to
+8.2.7, for example **Ubuntu 26.04**, which ships 8.1. Remove the distribution's version first
+(`sudo apt remove easyeffects` on Ubuntu) so only one EasyEffects runs:
+
+```bash
+flatpak install flathub com.github.wwmm.easyeffects
+```
+
+Then check the version (for the Flatpak, look at the Version line of
+`flatpak info com.github.wwmm.easyeffects`):
 
 ```bash
 easyeffects --version
 ```
 
-It should print **7.something**. If the command is not found, or it prints 8 or higher, see
-[Which version do I have?](#which-version-do-i-have) below.
+Any 7.x version, or 8.2.8 or newer, is fine.
 
 You don't have to set anything up inside EasyEffects. Ferospark Equalizer starts it in the
 background, and if the equalizer effect is missing it shows an **Add equalizer** button.
@@ -80,6 +97,12 @@ On Fedora:
 sudo dnf install git python3-gobject python3-cairo libadwaita python3-numpy pipewire-utils pulseaudio-utils
 ```
 
+On Arch:
+
+```bash
+sudo pacman -S git python-gobject python-cairo libadwaita python-numpy pipewire libpulse
+```
+
 ### Step 3: install Ferospark Equalizer
 
 ```bash
@@ -93,19 +116,6 @@ The installer checks that everything above is present and tells you what is miss
 
 To remove it later, run `./install.sh --uninstall` from the same folder. EasyEffects and your
 presets are left alone.
-
-### Which version do I have?
-
-| Your system | EasyEffects it ships | Works? |
-|---|---|---|
-| Ubuntu 24.04 / 25.10, Zorin 18, Mint 22, Pop!_OS 24.04 | 7.x | Yes |
-| Debian 13 (trixie), Fedora 42 | 7.x | Yes |
-| Ubuntu 26.04, Debian testing/unstable, Arch, Fedora Rawhide | 8.x | Not yet |
-| Flatpak (Flathub), on any distribution | 8.x | No |
-
-If you already installed the Flatpak version, remove it with
-`flatpak uninstall com.github.wwmm.easyeffects` and install the distribution package as shown in
-Step 1.
 
 ## Presets included
 
@@ -138,7 +148,12 @@ choose *Start flat*, then type each band's frequency, gain, Q and filter type fr
   that restores the on/off state at login. EasyEffects always turns itself back on when it
   starts, so this entry is what keeps "off" off. It replaces EasyEffects' own
   `easyeffects-service.desktop` autostart entry, if you have one.
-- Presets live in `~/.config/easyeffects/output/`.
+- Presets live in EasyEffects' own preset folder: `~/.config/easyeffects/output/` for
+  EasyEffects 7, `~/.local/share/easyeffects/output/` for EasyEffects 8, and
+  `~/.var/app/com.github.wwmm.easyeffects/data/easyeffects/output/` for the Flatpak.
+- With EasyEffects 8, other apps can't change the effects list. If the current preset has no
+  equalizer, **Add equalizer** loads the "Ferospark – Flat" preset instead, which replaces that
+  preset's other effects.
 
 ## Support development
 

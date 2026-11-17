@@ -27,7 +27,10 @@ python3 -c 'import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw
     || missing+=("GTK 4 + libadwaita for Python (Debian/Ubuntu: python3-gi gir1.2-adw-1)")
 python3 -c 'import cairo' 2>/dev/null || missing+=("pycairo (python3-gi-cairo)")
 python3 -c 'import numpy' 2>/dev/null || missing+=("numpy (python3-numpy)")
-command -v easyeffects >/dev/null || missing+=("EasyEffects 7.x: see 'Step 1' in README.md (the Flatpak version will NOT work)")
+if ! command -v easyeffects >/dev/null \
+   && ! flatpak info com.github.wwmm.easyeffects >/dev/null 2>&1; then
+    missing+=("EasyEffects: see 'Step 1' in README.md")
+fi
 command -v pw-cat >/dev/null || missing+=("pw-cat (pipewire-bin)")
 command -v pactl >/dev/null || missing+=("pactl (pulseaudio-utils)")
 
@@ -38,11 +41,13 @@ if [ ${#missing[@]} -gt 0 ]; then
     exit 1
 fi
 
-ver="$(easyeffects --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)"
-if [ -n "$ver" ] && [ "${ver%%.*}" -ge 8 ]; then
-    echo "Warning: EasyEffects $ver found. Ferospark Equalizer is built for EasyEffects 7.x;"
-    echo "         version 8 changed how it stores settings, so the EQ may not respond."
+ver="$(easyeffects --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+if [ -z "$ver" ]; then
+    ver="$(flatpak info com.github.wwmm.easyeffects 2>/dev/null | awk '/Version:/ {print $2}')"
 fi
+case "$ver" in
+    8.0.*|8.1.*|8.2.[0-7]) echo "Warning: EasyEffects $ver is too old for the equalizer controls; please update to 8.2.8 or newer." ;;
+esac
 
 # ── install ─────────────────────────────────────────────────────────────────
 mkdir -p "$DEST/data/presets" "$APPS" "$ICONS"
